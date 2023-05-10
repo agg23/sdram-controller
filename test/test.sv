@@ -4,7 +4,7 @@
 
 module test;
 
-`include "sdr_parameters.vh"
+`include "pocket_parameters.vh"
 
 reg                     clk;                           // Clock
 reg                     cke;                           // Synchronous Clock Enable

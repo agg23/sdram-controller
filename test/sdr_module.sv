@@ -2,7 +2,7 @@
 
 module sdr_module (Dq, Addr, Ba, Clk, Cke, Cs_n, Ras_n, Cas_n, We_n, Dqm);
 
-`include "sdr_parameters.vh"
+`include "pocket_parameters.vh"
 
     inout            [63 : 0] Dq;                                      // Data IO
     input [ADDR_BITS - 1 : 0] Addr;                                    // Address
