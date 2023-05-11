@@ -28,16 +28,16 @@ module sdram #(
     input wire p0_rd_req,
 
     output wire p0_available,  // The port is able to be used
-    output reg p0_ready,  // The port has finished its task. Will rise for a single cycle
+    output reg  p0_ready = 0,  // The port has finished its task. Will rise for a single cycle
 
     inout  wire [15:0] SDRAM_DQ,    // Bidirectional data bus
     output reg  [12:0] SDRAM_A,     // Address bus
     output reg  [ 1:0] SDRAM_DQM,   // High/low byte mask
     output reg  [ 1:0] SDRAM_BA,    // Bank select (single bits)
-    output reg         SDRAM_nCS,   // Chip select, neg triggered
-    output reg         SDRAM_nWE,   // Write enable, neg triggered
-    output reg         SDRAM_nRAS,  // Select row address, neg triggered
-    output reg         SDRAM_nCAS,  // Select column address, neg triggered
+    output wire        SDRAM_nCS,   // Chip select, neg triggered
+    output wire        SDRAM_nWE,   // Write enable, neg triggered
+    output wire        SDRAM_nRAS,  // Select row address, neg triggered
+    output wire        SDRAM_nCAS,  // Select column address, neg triggered
     output reg         SDRAM_CKE,   // Clock enable
     output wire        SDRAM_CLK    // Chip clock
 );
@@ -74,6 +74,11 @@ module sdram #(
 
   // 8,192 refresh commands every 64ms = 7.8125us, which we round to 7500ns to make sure we hit them all
   localparam SETTING_REFRESH_TIMER_NANO_SEC = 7500;
+
+  // Reads will be delayed by 1 cycle when enabled
+  // Highly recommended that you use with SDRAM with FAST_INPUT_REGISTER enabled for timing and stability
+  // This makes read timing incompatible with the test model
+  localparam SETTING_USE_FAST_INPUT_REGISTER = 1;
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // Generated parameters
@@ -137,35 +142,56 @@ module sdram #(
     reg [1:0]  port_byte_en;
   } port_selection;
 
+  // nCS, nRAS, nCAS, nWE
+  typedef enum bit [3:0] {
+    COMMAND_NOP           = 4'b0111,
+    COMMAND_ACTIVE        = 4'b0011,
+    COMMAND_READ          = 4'b0101,
+    COMMAND_WRITE         = 4'b0100,
+    COMMAND_PRECHARGE     = 4'b0010,
+    COMMAND_AUTO_REFRESH  = 4'b0001,
+    COMMAND_LOAD_MODE_REG = 4'b0000
+  } command;
+
   ////////////////////////////////////////////////////////////////////////////////////////
   // State machine
 
-  localparam STATE_INIT = 0;
-  localparam STATE_IDLE = 1;
-  localparam STATE_DELAY = 2;
-  localparam STATE_WRITE = 3;
-  localparam STATE_READ = 4;
-  localparam STATE_READ_OUTPUT = 5;
+  typedef enum bit [2:0] {
+    INIT,
+    IDLE,
+    DELAY,
+    WRITE,
+    READ,
+    READ_OUTPUT
+  } state_fsm;
 
-  reg [ 2:0] state = STATE_INIT;
+  state_fsm state;
 
   // TODO: Could use fewer bits
   reg [31:0] delay_counter = 0;
   // The number of words we're reading
-  reg [ 3:0] read_counter = 0;
+  reg [3:0] read_counter = 0;
 
   // Measures when auto refresh needs to be triggered
   reg [15:0] refresh_counter = 0;
 
-  reg [ 1:0] active_port = 0;
+  reg [1:0] active_port = 0;
 
-  reg [ 2:0] delay_state = STATE_IDLE;
+  state_fsm delay_state;
 
-  localparam OP_NONE = 0;
-  localparam OP_WRITE = 1;
-  localparam OP_READ = 2;
+  typedef enum bit [1:0] {
+    IO_NONE,
+    IO_WRITE,
+    IO_READ
+  } io_operation;
 
-  reg [1:0] current_io_operation = OP_NONE;
+  io_operation current_io_operation;
+
+  command sdram_command;
+  assign {SDRAM_nCS, SDRAM_nRAS, SDRAM_nCAS, SDRAM_nWE} = sdram_command;
+
+  ////////////////////////////////////////////////////////////////////////////////////////
+  // Port specifics
 
   // Cache the signals we received, potentially while busy
   reg p0_wr_queue = 0;
@@ -182,12 +208,12 @@ module sdram #(
   // An active new request or cached request
   wire port_req = p0_req || p0_req_queue;
 
+  ////////////////////////////////////////////////////////////////////////////////////////
+  // Helpers
+
   // Activates a row
   task set_active_command(reg [1:0] port, reg [24:0] addr);
-    SDRAM_nCS <= 0;
-    SDRAM_nRAS <= 0;
-    SDRAM_nCAS <= 1;
-    SDRAM_nWE <= 1;
+    sdram_command <= COMMAND_ACTIVE;
 
     // Upper two bits choose the bank
     SDRAM_BA <= addr[24:23];
@@ -219,9 +245,12 @@ module sdram #(
   reg [15:0] sdram_data = 0;
   assign SDRAM_DQ = dq_output ? sdram_data : 16'hZZZZ;
 
-  assign init_complete = state != STATE_INIT;
+  assign init_complete = state != INIT;
 
-  assign p0_available = state == STATE_IDLE && ~port_req;
+  assign p0_available = state == IDLE && ~port_req;
+
+  ////////////////////////////////////////////////////////////////////////////////////////
+  // Process
 
   always @(posedge clk) begin
     if (reset) begin
@@ -229,6 +258,13 @@ module sdram #(
       SDRAM_CKE <= 0;
 
       delay_counter <= 0;
+
+      delay_state <= IDLE;
+      current_io_operation <= IO_NONE;
+
+      sdram_command <= COMMAND_NOP;
+
+      p0_ready <= 0;
 
       p0_wr_queue <= 0;
       p0_rd_queue <= 0;
@@ -238,13 +274,13 @@ module sdram #(
       p0_q <= 0;
     end else begin
       // Cache port 0 input values
-      if (p0_wr_req && current_io_operation != OP_WRITE) begin
+      if (p0_wr_req && current_io_operation != IO_WRITE) begin
         p0_wr_queue <= 1;
 
         p0_byte_en_queue <= p0_byte_en;
         p0_addr_queue <= p0_addr;
         p0_data_queue <= p0_data;
-      end else if (p0_rd_req && current_io_operation != OP_READ) begin
+      end else if (p0_rd_req && current_io_operation != IO_READ) begin
         p0_rd_queue   <= 1;
 
         p0_addr_queue <= p0_addr;
@@ -252,17 +288,14 @@ module sdram #(
 
       // Default to NOP at all times in between commands
       // NOP
-      SDRAM_nCS  <= 0;
-      SDRAM_nRAS <= 1;
-      SDRAM_nCAS <= 1;
-      SDRAM_nWE  <= 1;
+      sdram_command <= COMMAND_NOP;
 
-      if (state != STATE_INIT) begin
+      if (state != INIT) begin
         refresh_counter <= refresh_counter + 16'h1;
       end
 
       case (state)
-        STATE_INIT: begin
+        INIT: begin
           delay_counter <= delay_counter + 32'h1;
 
           if (delay_counter == CYCLES_UNTIL_START_INHIBIT) begin
@@ -273,63 +306,51 @@ module sdram #(
             // We're already asserting NOP above
           end else if (delay_counter == CYCLES_UNTIL_CLEAR_INHIBIT) begin
             // Clear inhibit, start precharge
-            SDRAM_nCS   <= 0;
-            SDRAM_nRAS  <= 0;
-            SDRAM_nCAS  <= 1;
-            SDRAM_nWE   <= 0;
+            sdram_command <= COMMAND_PRECHARGE;
 
             // Mark all banks for refresh
-            SDRAM_A[10] <= 1;
+            SDRAM_A[10]   <= 1;
           end else if (delay_counter == CYCLES_UNTIL_INIT_PRECHARGE_END || delay_counter == CYCLES_UNTIL_REFRESH1_END) begin
             // Precharge done (or first auto refresh), auto refresh
             // CKE high specifies auto refresh
-            SDRAM_CKE  <= 1;
+            SDRAM_CKE <= 1;
 
-            SDRAM_nCS  <= 0;
-            SDRAM_nRAS <= 0;
-            SDRAM_nCAS <= 0;
-            SDRAM_nWE  <= 1;
+            sdram_command <= COMMAND_AUTO_REFRESH;
           end else if (delay_counter == CYCLES_UNTIL_REFRESH2_END) begin
             // Second auto refresh done, load mode register
-            SDRAM_nCS <= 0;
-            SDRAM_nRAS <= 0;
-            SDRAM_nCAS <= 0;
-            SDRAM_nWE <= 0;
+            sdram_command <= COMMAND_LOAD_MODE_REG;
 
             SDRAM_BA <= 2'b0;
 
             SDRAM_A <= configured_mode;
           end else if (delay_counter == CYCLES_UNTIL_REFRESH2_END + SETTING_T_MRD_MIN_LOAD_MODE_CLOCK_CYCLES) begin
             // We can now execute commands
-            state <= STATE_IDLE;
+            state <= IDLE;
           end
         end
-        STATE_IDLE: begin
+        IDLE: begin
           // Stop outputting on DQ and hold in high Z
           dq_output <= 0;
 
           p0_ready <= 0;
 
-          current_io_operation <= OP_NONE;
+          current_io_operation <= IO_NONE;
 
           if (refresh_counter >= CYCLES_PER_REFRESH[15:0]) begin
             // Trigger refresh
-            state <= STATE_DELAY;
-            delay_state <= STATE_IDLE;
+            state <= DELAY;
+            delay_state <= IDLE;
             delay_counter <= CYCLES_FOR_AUTOREFRESH - 32'h2;
 
             refresh_counter <= 0;
 
-            SDRAM_nCS <= 0;
-            SDRAM_nRAS <= 0;
-            SDRAM_nCAS <= 0;
-            SDRAM_nWE <= 1;
+            sdram_command <= COMMAND_AUTO_REFRESH;
           end else if (p0_wr_req || p0_wr_queue) begin
             // Port 0 write
-            state <= STATE_DELAY;
-            delay_state <= STATE_WRITE;
+            state <= DELAY;
+            delay_state <= WRITE;
 
-            current_io_operation <= OP_WRITE;
+            current_io_operation <= IO_WRITE;
 
             // Clear queued action
             p0_wr_queue <= 0;
@@ -337,43 +358,40 @@ module sdram #(
             set_active_command(0, p0_addr_current);
           end else if (p0_rd_req || p0_rd_queue) begin
             // Port 0 read
-            state <= STATE_DELAY;
-            delay_state <= STATE_READ;
+            state <= DELAY;
+            delay_state <= READ;
 
-            current_io_operation <= OP_READ;
+            current_io_operation <= IO_READ;
 
             set_active_command(0, p0_addr_current);
           end
         end
-        STATE_DELAY: begin
+        DELAY: begin
           if (delay_counter > 0) begin
             delay_counter <= delay_counter - 32'h1;
           end else begin
             state <= delay_state;
-            delay_state <= STATE_IDLE;
+            delay_state <= IDLE;
 
-            if (delay_state == STATE_IDLE && current_io_operation != OP_NONE) begin
+            if (delay_state == IDLE && current_io_operation != IO_NONE) begin
               case (active_port)
                 0: p0_ready <= 1;
               endcase
             end
           end
         end
-        STATE_WRITE: begin
+        WRITE: begin
           // Write to the selected row
           port_selection active_port_entries;
 
-          state <= STATE_DELAY;
+          state <= DELAY;
           // A write must wait for auto precharge (tWR) and precharge command period (tRP)
           // Takes one cycle to get back to IDLE, and another to read command
           delay_counter <= CYCLES_AFTER_WRITE_FOR_NEXT_COMMAND - 32'h2;
 
           active_port_entries = get_active_port();
 
-          SDRAM_nCS <= 0;
-          SDRAM_nRAS <= 1;
-          SDRAM_nCAS <= 0;
-          SDRAM_nWE <= 0;
+          sdram_command <= COMMAND_WRITE;
 
           // NOTE: Bank is still set from ACTIVE command assertion
           // High bit enables auto precharge. I assume the top 2 bits are unused
@@ -385,22 +403,22 @@ module sdram #(
           // Use byte enable from port
           SDRAM_DQM <= ~active_port_entries.port_byte_en;
         end
-        STATE_READ: begin
+        READ: begin
           // Read to the selected row
           port_selection active_port_entries;
 
-          if (CAS_LATENCY == 1) begin
+          if (CAS_LATENCY == 1 && ~SETTING_USE_FAST_INPUT_REGISTER) begin
             // Go directly to read
-            state <= STATE_READ_OUTPUT;
+            state <= READ_OUTPUT;
           end else begin
-            state <= STATE_DELAY;
-            delay_state <= STATE_READ_OUTPUT;
+            state <= DELAY;
+            delay_state <= READ_OUTPUT;
 
             read_counter <= 0;
 
             // Takes one cycle to go to read data, and one to actually read the data
-            // TODO: This appears to be incorrect in hardware vs the model, hence the +1
-            delay_counter <= CAS_LATENCY - 32'h2 + 32'h1;
+            // Fast input register delays operation by a cycle
+            delay_counter <= CAS_LATENCY - 32'h2 + SETTING_USE_FAST_INPUT_REGISTER;
           end
 
           active_port_entries = get_active_port();
@@ -408,10 +426,7 @@ module sdram #(
           // Clear queued action
           p0_rd_queue <= 0;
 
-          SDRAM_nCS <= 0;
-          SDRAM_nRAS <= 1;
-          SDRAM_nCAS <= 0;
-          SDRAM_nWE <= 1;
+          sdram_command <= COMMAND_READ;
 
           // NOTE: Bank is still set from ACTIVE command assertion
           // High bit enables auto precharge. I assume the top 2 bits are unused
@@ -420,7 +435,7 @@ module sdram #(
           // Fetch all bytes
           SDRAM_DQM <= 2'b0;
         end
-        STATE_READ_OUTPUT: begin
+        READ_OUTPUT: begin
           reg [127:0] temp;
           reg [  3:0] expected_count;
 
@@ -436,7 +451,7 @@ module sdram #(
             read_counter <= read_counter + 4'h1;
           end else begin
             // We've read everything, and are done
-            state <= STATE_IDLE;
+            state <= IDLE;
           end
 
           case (read_counter)
@@ -488,7 +503,9 @@ module sdram #(
       // .sset()
   );
 
+  ////////////////////////////////////////////////////////////////////////////////////////
   // Parameter validation
+
   initial begin
     $info("Instantiated SDRAM with the following settings");
     $info("  Clock speed %f, period %f", CLOCK_SPEED_MHZ, CLOCK_PERIOD_NANO_SEC);
