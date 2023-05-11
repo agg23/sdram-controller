@@ -82,8 +82,8 @@ module sdram #(
   `CEIL(SETTING_INHIBIT_DELAY_MICRO_SEC * 1000 / CLOCK_PERIOD_NANO_SEC);
 
   // Number of cycles for precharge duration
-  localparam CYCLES_FOR_PRECHARGE =
-  `CEIL(SETTING_T_RP_MIN_PRECHARGE_CMD_PERIOD_NANO_SEC / CLOCK_PERIOD_NANO_SEC);
+  // localparam CYCLES_FOR_PRECHARGE =
+  // `CEIL(SETTING_T_RP_MIN_PRECHARGE_CMD_PERIOD_NANO_SEC / CLOCK_PERIOD_NANO_SEC);
 
   // Number of cycles for autorefresh duration
   localparam CYCLES_FOR_AUTOREFRESH =
@@ -97,9 +97,10 @@ module sdram #(
   localparam CYCLES_FOR_ACTIVE_ROW =
   `CEIL(SETTING_T_RCD_MIN_READ_WRITE_DELAY_NANO_SEC / CLOCK_PERIOD_NANO_SEC);
 
-  // Number of cycles after write that precharge_starts
-  localparam CYCLES_AFTER_WRITE_FOR_PRECHARGE_START =
-  `CEIL(SETTING_T_WR_MIN_WRITE_AUTO_PRECHARGE_RECOVERY_NANO_SEC / CLOCK_PERIOD_NANO_SEC);
+  // Number of cycles after write before next command
+  localparam CYCLES_AFTER_WRITE_FOR_NEXT_COMMAND =
+  `CEIL(
+      (SETTING_T_WR_MIN_WRITE_AUTO_PRECHARGE_RECOVERY_NANO_SEC + SETTING_T_RP_MIN_PRECHARGE_CMD_PERIOD_NANO_SEC) / CLOCK_PERIOD_NANO_SEC);
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // Init helpers
@@ -166,7 +167,8 @@ module sdram #(
     SDRAM_A <= addr[22:10];
 
     active_port <= port;
-    delay_counter <= CYCLES_FOR_ACTIVE_ROW;
+    // Current construction takes two cycles to write next data
+    delay_counter <= CYCLES_FOR_ACTIVE_ROW > 32'h2 ? CYCLES_FOR_ACTIVE_ROW - 32'h2 : 32'h0;
   endtask
 
   reg dq_output = 0;
@@ -287,7 +289,8 @@ module sdram #(
 
           state <= STATE_DELAY;
           // A write must wait for auto precharge (tWR) and precharge command period (tRP)
-          delay_counter <= CYCLES_AFTER_WRITE_FOR_PRECHARGE_START + CYCLES_FOR_PRECHARGE;
+          // Takes one cycle to get back to IDLE, and another to read command
+          delay_counter <= CYCLES_AFTER_WRITE_FOR_NEXT_COMMAND - 32'h2;
 
           case (active_port)
             0: begin
