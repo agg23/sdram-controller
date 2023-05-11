@@ -71,6 +71,9 @@ module sdram #(
   // tMRD - Min number of clock cycles between mode set and normal usage
   localparam SETTING_T_MRD_MIN_LOAD_MODE_CLOCK_CYCLES = 2;
 
+  // 8,192 refresh commands every 64ms = 7.8125us, which we round to 7500ns to make sure we hit them all
+  localparam SETTING_REFRESH_TIMER_NANO_SEC = 7500;
+
   ////////////////////////////////////////////////////////////////////////////////////////
   // Generated parameters
 
@@ -104,6 +107,10 @@ module sdram #(
   localparam CYCLES_AFTER_WRITE_FOR_NEXT_COMMAND =
   `CEIL(
       (SETTING_T_WR_MIN_WRITE_AUTO_PRECHARGE_RECOVERY_NANO_SEC + SETTING_T_RP_MIN_PRECHARGE_CMD_PERIOD_NANO_SEC) / CLOCK_PERIOD_NANO_SEC);
+
+  // Number of cycles between each autorefresh command
+  localparam CYCLES_PER_REFRESH =
+  `CEIL(SETTING_REFRESH_TIMER_NANO_SEC / CLOCK_PERIOD_NANO_SEC);
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // Init helpers
@@ -145,6 +152,9 @@ module sdram #(
   reg [31:0] delay_counter = 0;
   // The number of words we're reading
   reg [3:0] read_counter = 0;
+
+  // Measures when auto refresh needs to be triggered
+  reg [15:0] refresh_counter = 0;
 
   reg [1:0] active_port = 0;
 
@@ -240,6 +250,10 @@ module sdram #(
       SDRAM_nCAS <= 1;
       SDRAM_nWE  <= 1;
 
+      if (state != STATE_INIT) begin
+        refresh_counter <= refresh_counter + 16'h1;
+      end
+
       case (state)
         STATE_INIT: begin
           delay_counter <= delay_counter + 32'h1;
@@ -287,8 +301,19 @@ module sdram #(
           // Stop outputting on DQ and hold in high Z
           dq_output <= 0;
 
-          // TODO: Check for refresh
-          if (p0_wr_req || p0_wr_queue) begin
+          if (refresh_counter >= CYCLES_PER_REFRESH[15:0]) begin
+            // Trigger refresh
+            state <= STATE_DELAY;
+            delay_state <= STATE_IDLE;
+            delay_counter <= CYCLES_FOR_AUTOREFRESH - 32'h2;
+
+            refresh_counter <= 0;
+
+            SDRAM_nCS <= 0;
+            SDRAM_nRAS <= 0;
+            SDRAM_nCAS <= 0;
+            SDRAM_nWE <= 1;
+          end else if (p0_wr_req || p0_wr_queue) begin
             // Port 0 write
             state <= STATE_DELAY;
             delay_state <= STATE_WRITE;
@@ -386,7 +411,7 @@ module sdram #(
           endcase
 
           if (read_counter < expected_count) begin
-            read_counter <= read_counter + 4'h4;
+            read_counter <= read_counter + 4'h1;
           end else begin
             // We've read everything, and are done
             state <= STATE_IDLE;
@@ -438,7 +463,7 @@ module sdram #(
   // Parameter validation
   initial begin
     $info("Instantiated SDRAM with the following settings");
-    $info("  Clock speed %6f, period %6f", CLOCK_SPEED_MHZ, CLOCK_PERIOD_NANO_SEC);
+    $info("  Clock speed %f, period %f", CLOCK_SPEED_MHZ, CLOCK_PERIOD_NANO_SEC);
 
     if (CLOCK_SPEED_MHZ <= 0 || CLOCK_PERIOD_NANO_SEC <= SETTING_T_CK_MIN_CLOCK_CYCLE_TIME_NANO_SEC) begin
       $error("Invalid clock speed. Quitting");
@@ -446,13 +471,13 @@ module sdram #(
 
     $info("--------------------");
     $info("Configured values:");
-    $info("  CAS Latency %1h", CAS_LATENCY);
+    $info("  CAS Latency %h", CAS_LATENCY);
 
     if (CAS_LATENCY != 1 && CAS_LATENCY != 2 && CAS_LATENCY != 3) begin
       $error("Unknown CAS latency");
     end
 
-    $info("  Burst length %1h", BURST_LENGTH);
+    $info("  Burst length %h", BURST_LENGTH);
 
     if (BURST_LENGTH != 1 && BURST_LENGTH != 2 && BURST_LENGTH != 4 && BURST_LENGTH != 8) begin
       $error("Unknown burst length");
@@ -474,7 +499,7 @@ module sdram #(
 
     $info("--------------------");
     $info("Port values:");
-    $info("  Port 0 burst length %1d, port width %3d", P0_BURST_LENGTH, P0_OUTPUT_WIDTH + 1);
+    $info("  Port 0 burst length %d, port width %d", P0_BURST_LENGTH, P0_OUTPUT_WIDTH + 1);
 
     if (P0_BURST_LENGTH > BURST_LENGTH) begin
       $error("Port 0 burst length exceeds global burst length");
@@ -482,10 +507,10 @@ module sdram #(
 
     $info("--------------------");
     $info("Delays:");
-    $info("  Cycles until start inhibit %6f, clear inhibit %6f", CYCLES_UNTIL_START_INHIBIT,
+    $info("  Cycles until start inhibit %f, clear inhibit %f", CYCLES_UNTIL_START_INHIBIT,
           CYCLES_UNTIL_CLEAR_INHIBIT);
 
-    $info("  Cycles until between active commands %6f, command duration %6f",
+    $info("  Cycles until between active commands %f, command duration %f",
           CYCLES_BETWEEN_ACTIVE_COMMAND, CYCLES_FOR_ACTIVE_ROW);
   end
 
