@@ -10,7 +10,7 @@ module sdram_tb;
 
   reg [24:0] p0_addr = 0;
   reg [15:0] p0_data = 0;
-  wire [31:0] p0_q;
+  wire [127:0] p0_q;
 
   reg p0_wr_req = 0;
   reg p0_rd_req = 0;
@@ -47,8 +47,8 @@ module sdram_tb;
 
   sdram #(
       .CLOCK_SPEED_MHZ(100),
-      .BURST_LENGTH(2),
-      .P0_BURST_LENGTH(2)
+      .BURST_LENGTH(8),
+      .P0_BURST_LENGTH(8)
   ) sdram (
       .clk(clk),
       .reset(reset),
@@ -97,8 +97,9 @@ module sdram_tb;
     p0_wr_req = 1;
 
     #20;
-    p0_addr   = 0;
-    p0_data   = 0;
+    p0_addr = 0;
+    p0_data = 0;
+    #20;
     p0_wr_req = 0;
 
     @(posedge clk iff p0_ready);
@@ -119,6 +120,91 @@ module sdram_tb;
 
     #10;
 
+    p0_addr   = 25'h0_32_2022;
+    p0_data   = 16'h9ABC;
+
+    p0_wr_req = 1;
+
+    #20;
+    p0_addr   = 0;
+    p0_data   = 0;
+    p0_wr_req = 0;
+
+    @(posedge clk iff p0_ready);
+
+    #10;
+
+    p0_addr   = 25'h0_32_2023;
+    p0_data   = 16'hDEF0;
+
+    p0_wr_req = 1;
+
+    #20;
+    p0_addr   = 0;
+    p0_data   = 0;
+    p0_wr_req = 0;
+
+    @(posedge clk iff p0_ready);
+
+    #10;
+
+    p0_addr   = 25'h0_32_2024;
+    p0_data   = 16'hFEDC;
+
+    p0_wr_req = 1;
+
+    #20;
+    p0_addr   = 0;
+    p0_data   = 0;
+    p0_wr_req = 0;
+
+    @(posedge clk iff p0_ready);
+
+    #10;
+
+    p0_addr   = 25'h0_32_2025;
+    p0_data   = 16'hBA98;
+
+    p0_wr_req = 1;
+
+    #20;
+    p0_addr   = 0;
+    p0_data   = 0;
+    p0_wr_req = 0;
+
+    @(posedge clk iff p0_ready);
+
+    #10;
+
+    p0_addr   = 25'h0_32_2026;
+    p0_data   = 16'h7654;
+
+    p0_wr_req = 1;
+
+    #20;
+    p0_addr   = 0;
+    p0_data   = 0;
+    p0_wr_req = 0;
+
+    @(posedge clk iff p0_ready);
+
+    #10;
+
+    p0_addr   = 25'h0_32_2027;
+    p0_data   = 16'h3210;
+
+    p0_wr_req = 1;
+
+    #20;
+    p0_addr   = 0;
+    p0_data   = 0;
+    p0_wr_req = 0;
+
+    @(posedge clk iff p0_ready);
+
+    #10;
+
+    // Read
     p0_addr = 25'h0_32_2020;
     p0_data = 16'hFFFF;
 

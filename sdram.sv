@@ -27,7 +27,8 @@ module sdram #(
     input wire p0_wr_req,
     input wire p0_rd_req,
 
-    output wire p0_ready,
+    output wire p0_available,  // The port is able to be used
+    output reg p0_ready,  // The port has finished its task. Will rise for a single cycle
 
     inout  wire [15:0] SDRAM_DQ,    // Bidirectional data bus
     output reg  [12:0] SDRAM_A,     // Address bus
@@ -146,19 +147,25 @@ module sdram #(
   localparam STATE_READ = 4;
   localparam STATE_READ_OUTPUT = 5;
 
-  reg [2:0] state = STATE_INIT;
+  reg [ 2:0] state = STATE_INIT;
 
   // TODO: Could use fewer bits
   reg [31:0] delay_counter = 0;
   // The number of words we're reading
-  reg [3:0] read_counter = 0;
+  reg [ 3:0] read_counter = 0;
 
   // Measures when auto refresh needs to be triggered
   reg [15:0] refresh_counter = 0;
 
-  reg [1:0] active_port = 0;
+  reg [ 1:0] active_port = 0;
 
-  reg [2:0] delay_state = STATE_IDLE;
+  reg [ 2:0] delay_state = STATE_IDLE;
+
+  localparam OP_NONE = 0;
+  localparam OP_WRITE = 1;
+  localparam OP_READ = 2;
+
+  reg [1:0] current_io_operation = OP_NONE;
 
   // Cache the signals we received, potentially while busy
   reg p0_wr_queue = 0;
@@ -169,7 +176,7 @@ module sdram #(
 
   wire p0_req = p0_wr_req || p0_rd_req;
   wire p0_req_queue = p0_wr_queue || p0_rd_queue;
-  // The current p0 address that should be used for any operations on this cycle
+  // The current p0 address that should be used for any operations on this first cycle only
   wire [24:0] p0_addr_current = p0_req_queue ? p0_addr_queue : p0_addr;
 
   // An active new request or cached request
@@ -214,7 +221,7 @@ module sdram #(
 
   assign init_complete = state != STATE_INIT;
 
-  assign p0_ready = state == STATE_IDLE && ~port_req;
+  assign p0_available = state == STATE_IDLE && ~port_req;
 
   always @(posedge clk) begin
     if (reset) begin
@@ -231,13 +238,13 @@ module sdram #(
       p0_q <= 0;
     end else begin
       // Cache port 0 input values
-      if (p0_wr_req) begin
+      if (p0_wr_req && current_io_operation != OP_WRITE) begin
         p0_wr_queue <= 1;
 
         p0_byte_en_queue <= p0_byte_en;
         p0_addr_queue <= p0_addr;
         p0_data_queue <= p0_data;
-      end else if (p0_rd_req) begin
+      end else if (p0_rd_req && current_io_operation != OP_READ) begin
         p0_rd_queue   <= 1;
 
         p0_addr_queue <= p0_addr;
@@ -301,6 +308,10 @@ module sdram #(
           // Stop outputting on DQ and hold in high Z
           dq_output <= 0;
 
+          p0_ready <= 0;
+
+          current_io_operation <= OP_NONE;
+
           if (refresh_counter >= CYCLES_PER_REFRESH[15:0]) begin
             // Trigger refresh
             state <= STATE_DELAY;
@@ -318,6 +329,8 @@ module sdram #(
             state <= STATE_DELAY;
             delay_state <= STATE_WRITE;
 
+            current_io_operation <= OP_WRITE;
+
             // Clear queued action
             p0_wr_queue <= 0;
 
@@ -327,8 +340,7 @@ module sdram #(
             state <= STATE_DELAY;
             delay_state <= STATE_READ;
 
-            // Clear queued action
-            p0_rd_queue <= 0;
+            current_io_operation <= OP_READ;
 
             set_active_command(0, p0_addr_current);
           end
@@ -339,6 +351,12 @@ module sdram #(
           end else begin
             state <= delay_state;
             delay_state <= STATE_IDLE;
+
+            if (delay_state == STATE_IDLE && current_io_operation != OP_NONE) begin
+              case (active_port)
+                0: p0_ready <= 1;
+              endcase
+            end
           end
         end
         STATE_WRITE: begin
@@ -381,10 +399,14 @@ module sdram #(
             read_counter <= 0;
 
             // Takes one cycle to go to read data, and one to actually read the data
-            delay_counter <= CAS_LATENCY - 32'h2;
+            // TODO: This appears to be incorrect in hardware vs the model, hence the +1
+            delay_counter <= CAS_LATENCY - 32'h2 + 32'h1;
           end
 
           active_port_entries = get_active_port();
+
+          // Clear queued action
+          p0_rd_queue <= 0;
 
           SDRAM_nCS <= 0;
           SDRAM_nRAS <= 1;
@@ -429,7 +451,13 @@ module sdram #(
           endcase
 
           case (active_port)
-            0: p0_q <= temp[P0_OUTPUT_WIDTH:0];
+            0: begin
+              p0_q <= temp[P0_OUTPUT_WIDTH:0];
+
+              if (read_counter == expected_count) begin
+                p0_ready <= 1;
+              end
+            end
           endcase
         end
       endcase
