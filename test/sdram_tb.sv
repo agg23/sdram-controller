@@ -46,7 +46,9 @@ module sdram_tb;
   );
 
   sdram #(
-      .CLOCK_SPEED_MHZ(100)
+      .CLOCK_SPEED_MHZ(100),
+      .BURST_LENGTH(2),
+      .P0_BURST_LENGTH(2)
   ) sdram (
       .clk(clk),
       .reset(reset),
@@ -103,7 +105,7 @@ module sdram_tb;
 
     #10;
 
-    p0_addr   = 25'h0_32_2022;
+    p0_addr   = 25'h0_32_2021;
     p0_data   = 16'h5678;
 
     p0_wr_req = 1;
@@ -112,6 +114,20 @@ module sdram_tb;
     p0_addr   = 0;
     p0_data   = 0;
     p0_wr_req = 0;
+
+    @(posedge clk iff p0_ready);
+
+    #10;
+
+    p0_addr = 25'h0_32_2020;
+    p0_data = 16'hFFFF;
+
+    p0_byte_en = 2'h2;
+    p0_rd_req = 1;
+
+    #20;
+    p0_addr   = 0;
+    p0_rd_req = 0;
 
     @(posedge clk iff p0_ready);
 

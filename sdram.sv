@@ -9,17 +9,20 @@ module sdram #(
     parameter BURST_LENGTH = 1,  // 1, 2, 4, 8 words per read
     parameter BURST_TYPE = 0,  // 1 for interleaved
     parameter CAS_LATENCY = 2,  // 1, 2, or 3 cycle delays
-    parameter WRITE_BURST = 0  // 1 to enable write bursting
+    parameter WRITE_BURST = 0,  // 1 to enable write bursting
+
+    // Port config
+    parameter P0_BURST_LENGTH = BURST_LENGTH  // 1, 2, 4, 8 words per read
 ) (
     input wire clk,
     input wire reset,  // Used to trigger start of FSM
     output wire init_complete,  // SDRAM is done initializing
 
     // Port 0
-    input  wire [25:1] p0_addr,
-    input  wire [15:0] p0_data,
-    input  wire [ 1:0] p0_byte_en,  // Byte enable for writes
-    output reg  [31:0] p0_q,
+    input wire [24:0] p0_addr,
+    input wire [15:0] p0_data,
+    input wire [1:0] p0_byte_en,  // Byte enable for writes
+    output reg [P0_BURST_LENGTH * 16 - 1:0] p0_q,
 
     input wire p0_wr_req,
     input wire p0_rd_req,
@@ -118,6 +121,14 @@ module sdram #(
     3'b0, ~WRITE_BURST[0], 2'b0, CAS_LATENCY[2:0], BURST_TYPE[0], concrete_burst_length
   };
 
+  localparam P0_OUTPUT_WIDTH = P0_BURST_LENGTH * 16 - 1;
+
+  typedef struct {
+    reg [9:0]  port_addr;
+    reg [15:0] port_data;
+    reg [1:0]  port_byte_en;
+  } port_selection;
+
   ////////////////////////////////////////////////////////////////////////////////////////
   // State machine
 
@@ -125,33 +136,34 @@ module sdram #(
   localparam STATE_IDLE = 1;
   localparam STATE_DELAY = 2;
   localparam STATE_WRITE = 3;
+  localparam STATE_READ = 4;
+  localparam STATE_READ_OUTPUT = 5;
 
-  reg [ 7:0] state = STATE_INIT;
+  reg [2:0] state = STATE_INIT;
 
+  // TODO: Could use fewer bits
   reg [31:0] delay_counter = 0;
+  // The number of words we're reading
+  reg [3:0] read_counter = 0;
 
-  reg [ 1:0] active_port = 0;
+  reg [1:0] active_port = 0;
 
-  localparam ACTION_IDLE = 0;
-  localparam ACTION_READ = 1;
-  localparam ACTION_WRITE = 2;
-
-  reg [1:0] delay_action = ACTION_IDLE;
+  reg [2:0] delay_state = STATE_IDLE;
 
   // Cache the signals we received, potentially while busy
-  reg p0_wr_cache = 0;
-  reg p0_rd_cache = 0;
-  reg [1:0] p0_byte_en_cache = 0;
-  reg [24:0] p0_addr_cache = 0;
-  reg [15:0] p0_data_cache = 0;
+  reg p0_wr_queue = 0;
+  reg p0_rd_queue = 0;
+  reg [1:0] p0_byte_en_queue = 0;
+  reg [24:0] p0_addr_queue = 0;
+  reg [15:0] p0_data_queue = 0;
 
   wire p0_req = p0_wr_req || p0_rd_req;
-  wire p0_req_cache = p0_wr_cache || p0_rd_cache;
+  wire p0_req_queue = p0_wr_queue || p0_rd_queue;
   // The current p0 address that should be used for any operations on this cycle
-  wire [24:0] p0_addr_current = p0_req_cache ? p0_addr_cache : p0_addr;
+  wire [24:0] p0_addr_current = p0_req_queue ? p0_addr_queue : p0_addr;
 
   // An active new request or cached request
-  wire port_req = p0_req || p0_req_cache;
+  wire port_req = p0_req || p0_req_queue;
 
   // Activates a row
   task set_active_command(reg [1:0] port, reg [24:0] addr);
@@ -171,6 +183,20 @@ module sdram #(
     delay_counter <= CYCLES_FOR_ACTIVE_ROW > 32'h2 ? CYCLES_FOR_ACTIVE_ROW - 32'h2 : 32'h0;
   endtask
 
+  function port_selection get_active_port();
+    port_selection selection;
+
+    case (active_port)
+      0: begin
+        selection.port_addr = p0_addr_queue[9:0];
+        selection.port_data = p0_data_queue;
+        selection.port_byte_en = p0_byte_en_queue;
+      end
+    endcase
+
+    return selection;
+  endfunction
+
   reg dq_output = 0;
 
   reg [15:0] sdram_data = 0;
@@ -187,20 +213,24 @@ module sdram #(
 
       delay_counter <= 0;
 
-      p0_wr_cache <= 0;
-      p0_rd_cache <= 0;
+      p0_wr_queue <= 0;
+      p0_rd_queue <= 0;
+
+      dq_output <= 0;
+
+      p0_q <= 0;
     end else begin
       // Cache port 0 input values
       if (p0_wr_req) begin
-        p0_wr_cache <= 1;
+        p0_wr_queue <= 1;
 
-        p0_byte_en_cache <= p0_byte_en;
-        p0_addr_cache <= p0_addr;
-        p0_data_cache <= p0_data;
+        p0_byte_en_queue <= p0_byte_en;
+        p0_addr_queue <= p0_addr;
+        p0_data_queue <= p0_data;
       end else if (p0_rd_req) begin
-        p0_rd_cache   <= 1;
+        p0_rd_queue   <= 1;
 
-        p0_addr_cache <= p0_addr;
+        p0_addr_queue <= p0_addr;
       end
 
       // Default to NOP at all times in between commands
@@ -258,12 +288,22 @@ module sdram #(
           dq_output <= 0;
 
           // TODO: Check for refresh
-          if (p0_wr_req || p0_wr_cache) begin
+          if (p0_wr_req || p0_wr_queue) begin
             // Port 0 write
             state <= STATE_DELAY;
-            delay_action <= ACTION_WRITE;
+            delay_state <= STATE_WRITE;
 
-            p0_wr_cache <= 0;
+            // Clear queued action
+            p0_wr_queue <= 0;
+
+            set_active_command(0, p0_addr_current);
+          end else if (p0_rd_req || p0_rd_queue) begin
+            // Port 0 read
+            state <= STATE_DELAY;
+            delay_state <= STATE_READ;
+
+            // Clear queued action
+            p0_rd_queue <= 0;
 
             set_active_command(0, p0_addr_current);
           end
@@ -272,33 +312,20 @@ module sdram #(
           if (delay_counter > 0) begin
             delay_counter <= delay_counter - 32'h1;
           end else begin
-            // TODO: Change
-            delay_action <= ACTION_IDLE;
-
-            case (delay_action)
-              ACTION_IDLE:  state <= STATE_IDLE;
-              ACTION_WRITE: state <= STATE_WRITE;
-            endcase
+            state <= delay_state;
+            delay_state <= STATE_IDLE;
           end
         end
         STATE_WRITE: begin
           // Write to the selected row
-          reg [ 9:0] port_addr;
-          reg [15:0] port_data;
-          reg [ 1:0] port_byte_en;
+          port_selection active_port_entries;
 
           state <= STATE_DELAY;
           // A write must wait for auto precharge (tWR) and precharge command period (tRP)
           // Takes one cycle to get back to IDLE, and another to read command
           delay_counter <= CYCLES_AFTER_WRITE_FOR_NEXT_COMMAND - 32'h2;
 
-          case (active_port)
-            0: begin
-              port_addr = p0_addr_cache[9:0];
-              port_data = p0_data_cache;
-              port_byte_en = p0_byte_en_cache;
-            end
-          endcase
+          active_port_entries = get_active_port();
 
           SDRAM_nCS <= 0;
           SDRAM_nRAS <= 1;
@@ -307,12 +334,78 @@ module sdram #(
 
           // NOTE: Bank is still set from ACTIVE command assertion
           // High bit enables auto precharge. I assume the top 2 bits are unused
-          SDRAM_A <= {2'b0, 1'b1, port_addr};
+          SDRAM_A <= {2'b0, 1'b1, active_port_entries.port_addr};
+          // Enable DQ output
           dq_output <= 1;
-          sdram_data <= port_data;
+          sdram_data <= active_port_entries.port_data;
 
           // Use byte enable from port
-          SDRAM_DQM <= ~port_byte_en;
+          SDRAM_DQM <= ~active_port_entries.port_byte_en;
+        end
+        STATE_READ: begin
+          // Read to the selected row
+          port_selection active_port_entries;
+
+          if (CAS_LATENCY == 1) begin
+            // Go directly to read
+            state <= STATE_READ_OUTPUT;
+          end else begin
+            state <= STATE_DELAY;
+            delay_state <= STATE_READ_OUTPUT;
+
+            read_counter <= 0;
+
+            // Takes one cycle to go to read data, and one to actually read the data
+            delay_counter <= CAS_LATENCY - 32'h2;
+          end
+
+          active_port_entries = get_active_port();
+
+          SDRAM_nCS <= 0;
+          SDRAM_nRAS <= 1;
+          SDRAM_nCAS <= 0;
+          SDRAM_nWE <= 1;
+
+          // NOTE: Bank is still set from ACTIVE command assertion
+          // High bit enables auto precharge. I assume the top 2 bits are unused
+          SDRAM_A <= {2'b0, 1'b1, active_port_entries.port_addr};
+
+          // Fetch all bytes
+          SDRAM_DQM <= 2'b0;
+        end
+        STATE_READ_OUTPUT: begin
+          reg [127:0] temp;
+          reg [  3:0] expected_count;
+
+          case (active_port)
+            0: begin
+              temp[P0_OUTPUT_WIDTH:0] = p0_q;
+
+              expected_count = P0_BURST_LENGTH;
+            end
+          endcase
+
+          if (read_counter < expected_count) begin
+            read_counter <= read_counter + 4'h4;
+          end else begin
+            // We've read everything, and are done
+            state <= STATE_IDLE;
+          end
+
+          case (read_counter)
+            0: temp[15:0] = SDRAM_DQ;
+            1: temp[31:16] = SDRAM_DQ;
+            2: temp[47:32] = SDRAM_DQ;
+            3: temp[63:48] = SDRAM_DQ;
+            4: temp[79:64] = SDRAM_DQ;
+            5: temp[95:80] = SDRAM_DQ;
+            6: temp[111:96] = SDRAM_DQ;
+            7: temp[127:112] = SDRAM_DQ;
+          endcase
+
+          case (active_port)
+            0: p0_q <= temp[P0_OUTPUT_WIDTH:0];
+          endcase
         end
       endcase
     end
@@ -380,6 +473,15 @@ module sdram #(
     end
 
     $info("--------------------");
+    $info("Port values:");
+    $info("  Port 0 burst length %1d, port width %3d", P0_BURST_LENGTH, P0_OUTPUT_WIDTH + 1);
+
+    if (P0_BURST_LENGTH > BURST_LENGTH) begin
+      $error("Port 0 burst length exceeds global burst length");
+    end
+
+    $info("--------------------");
+    $info("Delays:");
     $info("  Cycles until start inhibit %6f, clear inhibit %6f", CYCLES_UNTIL_START_INHIBIT,
           CYCLES_UNTIL_CLEAR_INHIBIT);
 
