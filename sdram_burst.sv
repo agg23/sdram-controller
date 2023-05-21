@@ -509,7 +509,7 @@ module sdram_burst #(
             // Precharge to stop the burst
             set_precharge_command();
 
-            extra_burst_data_cycles <= CAS_LATENCY;
+            extra_burst_data_cycles <= CAS_LATENCY - 1;
 
             state <= DELAY;
             delay_counter <= CYCLES_FOR_PRECHARGE;
