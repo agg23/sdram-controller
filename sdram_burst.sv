@@ -72,6 +72,34 @@ module sdram_burst #(
   // tMRD - Min number of clock cycles between mode set and normal usage
   localparam SETTING_T_MRD_MIN_LOAD_MODE_CLOCK_CYCLES = 2;
 
+  // MiSTer values
+  // // tCK - Min clock cycle time
+  // localparam SETTING_T_CK_MIN_CLOCK_CYCLE_TIME_NANO_SEC = 7;
+
+  // // tRAS - Min row active time
+  // localparam SETTING_T_RAS_MIN_ROW_ACTIVE_TIME_NANO_SEC = 48;
+
+  // // tRC - Min row cycle time
+  // localparam SETTING_T_RC_MIN_ROW_CYCLE_TIME_NANO_SEC = 63;
+
+  // // tRP - Min precharge command period
+  // localparam SETTING_T_RP_MIN_PRECHARGE_CMD_PERIOD_NANO_SEC = 21;
+
+  // // tRFC - Min autorefresh period
+  // localparam SETTING_T_RFC_MIN_AUTOREFRESH_PERIOD_NANO_SEC = 80;
+
+  // // tRC - Min active to active command period for the same bank
+  // localparam SETTING_T_RC_MIN_ACTIVE_TO_ACTIVE_PERIOD_NANO_SEC = 63;
+
+  // // tRCD - Min read/write delay
+  // localparam SETTING_T_RCD_MIN_READ_WRITE_DELAY_NANO_SEC = 21;
+
+  // // tWR - Min write auto precharge recovery time
+  // localparam SETTING_T_WR_MIN_WRITE_AUTO_PRECHARGE_RECOVERY_NANO_SEC = 15;
+
+  // // tMRD - Min number of clock cycles between mode set and normal usage
+  // localparam SETTING_T_MRD_MIN_LOAD_MODE_CLOCK_CYCLES = 14;
+
   // 8,192 refresh commands every 64ms = 7.8125us, which we round to 7500ns to make sure we hit them all
   localparam SETTING_REFRESH_TIMER_NANO_SEC = 7500;
 
@@ -133,7 +161,7 @@ module sdram_burst #(
 
   localparam COLUMN_BITS_16 = {{(16 - SETTING_COLUMN_BITS) {1'b0}}, {SETTING_COLUMN_BITS{1'b1}}};
 
-  wire [15:0] burst_refresh_amount = refresh_counter + COLUMN_BITS_16 + 16'h10 /* synthesis keep */;
+  wire [15:0] burst_refresh_amount = refresh_counter + COLUMN_BITS_16 + 16'h10;
 
   wire [2:0] concrete_burst_length = 3'h7;
   // Reserved, write burst, operating mode, CAS latency, burst type, burst length
@@ -321,6 +349,9 @@ module sdram_burst #(
 
       dq_output <= 0;
     end else begin
+      reg needs_refresh;
+      needs_refresh = refresh_counter >= CYCLES_PER_REFRESH[15:0];
+
       // Cache port 0 input values
       if (p0_wr_req) begin
         p0_wr_queue <= 1;
@@ -385,7 +416,7 @@ module sdram_burst #(
 
           current_io_operation <= IO_NONE;
 
-          if (refresh_counter >= CYCLES_PER_REFRESH[15:0]) begin
+          if (needs_refresh) begin
             // Trigger refresh
             set_autorefresh_command();
           end else if (p0_wr_req || p0_wr_queue) begin
@@ -489,11 +520,14 @@ module sdram_burst #(
         end
         READ_OUTPUT: begin
           reg [127:0] temp;
-          reg [  3:0] expected_count;
+          reg [3:0] expected_count;
+          reg [SETTING_COLUMN_BITS-1:0] stop_burst_addr;
+
+          stop_burst_addr = {SETTING_COLUMN_BITS{1'b1}} - (CAS_LATENCY - 1);
 
           burst_addr <= burst_addr + 25'h1;
 
-          if (burst_addr[SETTING_COLUMN_BITS-1:0] + 'h1 == {SETTING_COLUMN_BITS{1'b1}} - (CAS_LATENCY - 1) || p0_end_burst_req) begin
+          if (burst_addr[SETTING_COLUMN_BITS-1:0] + 'h1 == stop_burst_addr || p0_end_burst_req) begin
             // Stop burst 3 cycles before edge of page
             // Precharge
             set_precharge_command();
@@ -504,8 +538,11 @@ module sdram_burst #(
             delay_counter <= CYCLES_FOR_PRECHARGE;
           end
 
-          if (refresh_counter >= CYCLES_PER_REFRESH[15:0]) begin
+          if (needs_refresh && stop_burst_addr - burst_addr[SETTING_COLUMN_BITS-1:0] > 'h10) begin
             // We need to refresh
+            // Only refresh if we're not close to the end of a page. If we're close to a page boundary,
+            // we will stop the burst automatically (or the user will), so a refresh will happen anyway
+
             // Precharge to stop the burst
             set_precharge_command();
 
