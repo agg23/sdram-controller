@@ -350,6 +350,10 @@ module sdram_burst #(
   ////////////////////////////////////////////////////////////////////////////////////////
   // Process
 
+  // Optimizations for better timing
+  reg needs_refresh = 0;
+  reg needs_burst_refresh = 0;
+
   always @(posedge clk) begin
     if (reset) begin
       // 2. Assert and hold CKE at logic low
@@ -369,8 +373,8 @@ module sdram_burst #(
 
       dq_output <= 0;
     end else begin
-      reg needs_refresh;
-      needs_refresh = refresh_counter >= CYCLES_PER_REFRESH[15:0];
+      needs_refresh <= refresh_counter >= CYCLES_PER_REFRESH[15:0];
+      needs_burst_refresh <= burst_refresh_amount >= CYCLES_PER_REFRESH[15:0];
 
       // Cache port 0 input values
       if (p0_wr_req) begin
@@ -455,7 +459,7 @@ module sdram_burst #(
             // reg [15:0] column_bits;
             // column_bits = {{(16 - SETTING_COLUMN_BITS) {1'b0}}, {SETTING_COLUMN_BITS{1'b1}}};
 
-            if (p0_rd_req && burst_refresh_amount >= CYCLES_PER_REFRESH[15:0]) begin
+            if (p0_rd_req && needs_burst_refresh) begin
               // We're about to take a long time, so check if we have refreshes soon, and run them
               // We need to refresh, so we will queue the read (automatically, by p0_rd_queue)
               set_autorefresh_command();
